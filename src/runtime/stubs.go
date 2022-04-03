@@ -17,6 +17,7 @@ func add(p unsafe.Pointer, x uintptr) unsafe.Pointer {
 	return unsafe.Pointer(uintptr(p) + x)
 }
 
+// getg返回“当前G”，利用了内核线程的TLS（线程本地存储）。
 // getg returns the pointer to the current g.
 // The compiler rewrites calls to this function into instructions
 // that fetch the g directly (from TLS or from the dedicated register).
@@ -38,6 +39,9 @@ func getg() *g
 // closure will be invalidated while it is still executing.
 func mcall(fn func(*g))
 
+// systemstack：在系统栈上运行传入的函数。
+// 系统栈也就是M的g0的栈。如果当前M正在运行其他的G，
+// 则要切换到g0再执行。
 // systemstack runs fn on a system stack.
 // If systemstack is called from the per-OS-thread (g0) stack, or
 // if systemstack is called from the signal handling (gsignal) stack,

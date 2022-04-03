@@ -156,6 +156,7 @@ GLOBL bad_cpu_msg<>(SB), RODATA, $84
 
 #endif
 
+// 汇编函数 runtime·rt0_go 是真正的程序入口
 TEXT runtime·rt0_go(SB),NOSPLIT|TOPFRAME,$0
 	// copy arguments forward on an even stack
 	MOVQ	DI, AX		// argc
@@ -262,12 +263,14 @@ needtls:
 	JEQ 2(PC)
 	CALL	runtime·abort(SB)
 ok:
+	// 创建g0和m0
 	// set the per-goroutine and per-mach "registers"
 	get_tls(BX)
 	LEAQ	runtime·g0(SB), CX
 	MOVQ	CX, g(BX)
 	LEAQ	runtime·m0(SB), AX
 
+	// m0和g0相互绑定
 	// save m->g0 = g0
 	MOVQ	CX, m_g0(AX)
 	// save m0 to g0->m
@@ -341,15 +344,20 @@ ok:
 	MOVQ	32(SP), AX		// copy argv
 	MOVQ	AX, 8(SP)
 	CALL	runtime·args(SB)
+	// 操作系统相关的初始化
 	CALL	runtime·osinit(SB)
+	// 调度系统初始化
 	CALL	runtime·schedinit(SB)
 
+	// 创建main goroutine，指向runtime.main函数
 	// create a new goroutine to start program
+	// 下面（约380行）有对mainPC的说明：它代表了runtime.main函数的值。
 	MOVQ	$runtime·mainPC(SB), AX		// entry
 	PUSHQ	AX
 	CALL	runtime·newproc(SB)
 	POPQ	AX
 
+	// 启动M
 	// start this M
 	CALL	runtime·mstart(SB)
 

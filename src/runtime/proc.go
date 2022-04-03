@@ -681,6 +681,7 @@ func schedinit() {
 		_g_.racectx, raceprocctx0 = raceinit()
 	}
 
+	// 把M的上限设置为10000
 	sched.maxmcount = 10000
 
 	// The world starts stopped.
@@ -1348,6 +1349,7 @@ func mstart()
 //go:nosplit
 //go:nowritebarrierrec
 func mstart0() {
+	// 任何M在启动时，首先获取到的G都是它的g0
 	_g_ := getg()
 
 	osStack := _g_.stack.lo == 0
@@ -1389,8 +1391,10 @@ func mstart0() {
 // so that we can set up g0.sched to return to the call of mstart1 above.
 //go:noinline
 func mstart1() {
+	// 任何M在启动时，首先获取到的G都是它的g0
 	_g_ := getg()
 
+	// 理论上这个校验不会失败
 	if _g_ != _g_.m.g0 {
 		throw("bad runtime·mstart")
 	}
@@ -1406,22 +1410,29 @@ func mstart1() {
 	_g_.sched.sp = getcallersp()
 
 	asminit()
+	// 初始化m
 	minit()
 
+	// 对m0的特殊处理：已知_g_是g0，如果g0的M是m0，执行mstartm0()
 	// Install signal handlers; after minit so that minit can
 	// prepare the thread to be able to handle the signals.
 	if _g_.m == &m0 {
 		mstartm0()
 	}
 
+	// 如果有m的起始任务函数，则执行，比如 sysmon 函数
+	// 对于m0来说，是没有 mstartfn 的
 	if fn := _g_.m.mstartfn; fn != nil {
 		fn()
 	}
 
+	// 如果M不是m0，在这里绑定一个P。
+	// m0因为schedinit时就已经绑定P了，这里就不用再绑定P。
 	if _g_.m != &m0 {
 		acquirep(_g_.m.nextp.ptr())
 		_g_.m.nextp = 0
 	}
+	// 进入调度，不会再返回
 	schedule()
 }
 
