@@ -357,7 +357,7 @@ ok:
 	CALL	runtime·newproc(SB)
 	POPQ	AX
 
-	// 启动M
+	// 启动m0
 	// start this M
 	CALL	runtime·mstart(SB)
 
