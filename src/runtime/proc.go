@@ -2247,6 +2247,8 @@ func stopm() {
 	mput(_g_.m)
 	unlock(&sched.lock)
 	mPark()
+	// mPark()会让M休眠，被唤醒后才会从mPark()返回
+	// mPark()返回后，首先要把M和P绑定
 	acquirep(_g_.m.nextp.ptr())
 	_g_.m.nextp = 0
 }
@@ -2541,6 +2543,7 @@ func execute(gp *g, inheritTime bool) {
 	gogo(&gp.sched)
 }
 
+// 找到一个可以运行的G，不找到就让M休眠，然后等待唤醒，直到找到一个G返回
 // Finds a runnable goroutine to execute.
 // Tries to steal from other P's, get g from local or global queue, poll network.
 func findrunnable() (gp *g, inheritTime bool) {
@@ -2560,6 +2563,7 @@ top:
 		runSafePointFn()
 	}
 
+	// 检查有无需要执行的timer
 	now, pollUntil, _ := checkTimers(_p_, 0)
 
 	if fingwait && fingwake {
@@ -2571,11 +2575,13 @@ top:
 		asmcgocall(*cgo_yield, nil)
 	}
 
+	// 从P本地队列获取G，如果获取到就返回
 	// local runq
 	if gp, inheritTime := runqget(_p_); gp != nil {
 		return gp, inheritTime
 	}
 
+	// 从全局队列获取G，如果获取到就返回
 	// global runq
 	if sched.runqsize != 0 {
 		lock(&sched.lock)
@@ -2586,6 +2592,9 @@ top:
 		}
 	}
 
+	// 检查netpoll（网络轮询）
+	// 检查是否有因网络就绪而变为可执行的G，如果有，就把G拿来执行。
+	// 条件：网络轮询已初始化 && 存在等待网络的G（waiter） && 当前没有（别的线程）在进行网络轮询检查。
 	// Poll network.
 	// This netpoll is only an optimization before we resort to stealing.
 	// We can safely skip it if there are no waiters or a thread is blocked
@@ -2605,13 +2614,17 @@ top:
 		}
 	}
 
+	// 工作窃取
 	// Spinning Ms: steal work from other Ps.
 	//
 	// Limit the number of spinning Ms to half the number of busy Ps.
 	// This is necessary to prevent excessive CPU consumption when
 	// GOMAXPROCS>>1 but the program parallelism is low.
 	procs := uint32(gomaxprocs)
-	if _g_.m.spinning || 2*atomic.Load(&sched.nmspinning) < procs-atomic.Load(&sched.npidle) {
+	nBusyP := procs - atomic.Load(&sched.npidle)
+	// 如果当前M正在自旋，或者没在自旋但所有自旋M数量不到工作中P数量的一半，
+	// 则可以进入自旋，并进行工作窃取。
+	if _g_.m.spinning || 2*atomic.Load(&sched.nmspinning) < nBusyP {
 		if !_g_.m.spinning {
 			_g_.m.spinning = true
 			atomic.Xadd(&sched.nmspinning, 1)
@@ -2634,6 +2647,7 @@ top:
 		}
 	}
 
+	// 在GC的黑化阶段，获取一个执行GC的G
 	// We have nothing to do.
 	//
 	// If we're in the GC mark phase, can safely scan and blacken objects,
@@ -2684,17 +2698,21 @@ top:
 		unlock(&sched.lock)
 		goto top
 	}
+	// 再一次尝试从全局队列获取G
 	if sched.runqsize != 0 {
 		gp := globrunqget(_p_, 0)
 		unlock(&sched.lock)
 		return gp, false
 	}
+	// 取消P、M绑定
 	if releasep() != _p_ {
 		throw("findrunnable: wrong p")
 	}
+	// 将P设为休眠
 	pidleput(_p_)
 	unlock(&sched.lock)
 
+	// 先把M自旋状态设置为“非自旋”，然后重试和上面类似的获取G步骤
 	// Delicate dance: thread transitions from spinning to non-spinning
 	// state, potentially concurrently with submission of new work. We must
 	// drop nmspinning first and then check all sources again (with
@@ -2728,6 +2746,8 @@ top:
 		// transitions as a conservative change to monitor effects on
 		// latency. See golang.org/issue/43997.
 
+		// 再次检查 有没有空闲，但本地队列非空的P
+		// 如果有，绑定P，重新开始自旋，并回到开头尝试获取G
 		// Check all runqueues once again.
 		_p_ = checkRunqsNoP(allpSnapshot, idlepMaskSnapshot)
 		if _p_ != nil {
@@ -2737,6 +2757,7 @@ top:
 			goto top
 		}
 
+		// 再次检查 有没有GC任务可运行的P，如果有，绑定P并返回一个执行GC的G
 		// Check for idle-priority GC work again.
 		_p_, gp = checkIdleGCNoP()
 		if _p_ != nil {
@@ -2762,6 +2783,7 @@ top:
 		pollUntil = checkTimersNoP(allpSnapshot, timerpMaskSnapshot, pollUntil)
 	}
 
+	// 再次检查netpoll
 	// Poll network until next timer.
 	if netpollinited() && (atomic.Load(&netpollWaiters) > 0 || pollUntil != 0) && atomic.Xchg64(&sched.lastpoll, 0) != 0 {
 		atomic.Store64(&sched.pollUntil, uint64(pollUntil))
@@ -2785,6 +2807,7 @@ top:
 			// When using fake time, just poll.
 			delay = 0
 		}
+		// netpoll结束的G的列表，表示可以执行的G
 		list := netpoll(delay) // block until new work is available
 		atomic.Store64(&sched.pollUntil, 0)
 		atomic.Store64(&sched.lastpoll, uint64(nanotime()))
@@ -2795,6 +2818,7 @@ top:
 			goto top
 		}
 		lock(&sched.lock)
+		// 获取一个休眠中的P
 		_p_ = pidleget()
 		unlock(&sched.lock)
 		if _p_ == nil {
@@ -2822,7 +2846,10 @@ top:
 			netpollBreak()
 		}
 	}
+
+	// 到最后都没有找到G，则M进入休眠
 	stopm()
+	// M被唤醒后，重新回到开头寻找一个可执行的G
 	goto top
 }
 
@@ -2922,6 +2949,7 @@ func stealWork(now int64) (gp *g, inheritTime bool, rnow, pollUntil int64, newWo
 	return nil, false, now, pollUntil, ranTimer
 }
 
+// 返回一个空闲，但本地队列非空的P
 // Check all Ps for a runnable G to steal.
 //
 // On entry we have no P. If a G is available to steal and a P is available,
@@ -3165,7 +3193,7 @@ top:
 	if _g_.m.spinning && (pp.runnext != 0 || pp.runqhead != pp.runqtail) {
 		throw("schedule: spinning with local work")
 	}
-	// 检查有无需要执行的Timer
+	// 检查有无需要执行的timer
 	checkTimers(pp, 0)
 
 	var gp *g
@@ -3189,21 +3217,25 @@ top:
 			tryWakeP = true
 		}
 	}
+	// 每调度61次，从全局队列获取1个G，避免全局队列中的G被饿死。
 	if gp == nil {
 		// Check the global runnable queue once in a while to ensure fairness.
 		// Otherwise two goroutines can completely occupy the local runqueue
 		// by constantly respawning each other.
 		if _g_.m.p.ptr().schedtick%61 == 0 && sched.runqsize > 0 {
 			lock(&sched.lock)
+			// 注意上限是1，不会批量转移G到P的本地队列，只返回一个G（如果有）
 			gp = globrunqget(_g_.m.p.ptr(), 1)
 			unlock(&sched.lock)
 		}
 	}
+	// 从本地队列获取G
 	if gp == nil {
 		gp, inheritTime = runqget(_g_.m.p.ptr())
 		// We can see gp != nil here even if the M is spinning,
 		// if checkTimers added a local goroutine via goready.
 	}
+	// findrunnable寻找G
 	if gp == nil {
 		gp, inheritTime = findrunnable() // blocks until work is available
 	}
@@ -5531,6 +5563,9 @@ func globrunqputbatch(batch *gQueue, n int32) {
 	*batch = gQueue{}
 }
 
+// 从全局队列获取G。
+// 移动一批G到P的本地队列，这个方法返回一个可以立刻执行的G。
+// 移动到P本地队列的G数量：全局队列G数量 / P数量 + 1 ， 但不超过P本地队列容量（256）的一半（128）。
 // Try get a batch of G's from the global runnable queue.
 // sched.lock must be held.
 func globrunqget(_p_ *p, max int32) *g {

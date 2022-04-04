@@ -1,20 +1,4 @@
-<!-- START doctoc generated TOC please keep comment here to allow auto update -->
-<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
-**Table of Contents**  *generated with [DocToc](https://github.com/thlorenz/doctoc)*
-
-- [总览](#%E6%80%BB%E8%A7%88)
-  - [osinit 操作系统相关的初始化](#osinit-%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E7%9B%B8%E5%85%B3%E7%9A%84%E5%88%9D%E5%A7%8B%E5%8C%96)
-  - [schedinit 调度系统初始化](#schedinit-%E8%B0%83%E5%BA%A6%E7%B3%BB%E7%BB%9F%E5%88%9D%E5%A7%8B%E5%8C%96)
-  - [创建main goroutine](#%E5%88%9B%E5%BB%BAmain-goroutine)
-  - [runtime·mstart 启动m0](#runtime%C2%B7mstart-%E5%90%AF%E5%8A%A8m0)
-  - [schedule函数调度实现](#schedule%E5%87%BD%E6%95%B0%E8%B0%83%E5%BA%A6%E5%AE%9E%E7%8E%B0)
-  - [main goroutine开始执行](#main-goroutine%E5%BC%80%E5%A7%8B%E6%89%A7%E8%A1%8C)
-- [细节](#%E7%BB%86%E8%8A%82)
-  - [getg - 获取当前G](#getg---%E8%8E%B7%E5%8F%96%E5%BD%93%E5%89%8Dg)
-  - [findrunnable - 找到可用的G](#findrunnable---%E6%89%BE%E5%88%B0%E5%8F%AF%E7%94%A8%E7%9A%84g)
-  - [newproc - 创建新的G](#newproc---%E5%88%9B%E5%BB%BA%E6%96%B0%E7%9A%84g)
-
-<!-- END doctoc generated TOC please keep comment here to allow auto update -->
+[TOC]
 
 # 总览
 
@@ -164,7 +148,7 @@ top:
 		goto top
 	}
 
-	// 检查有无需要执行的Timer
+	// 检查有无需要执行的timer
 	checkTimers(pp, 0)
 
 	var gp *g
@@ -199,8 +183,8 @@ top:
 ```
 
 1. 如果当前GC需要停止整个世界（STW), 则调用gcstopm休眠当前的M。
-2. 检查一下有没有Timer能够执行了，Timer是time.Timer和time.Ticker的底层实现。
-3. 每隔61次调度轮回从全局队列找，避免全局队列中的G被饿死。
+2. 检查一下有没有timer能够执行了，timer是time.Timer和time.Ticker的底层实现。
+3. 每调度61次，从全局队列获取1个G，避免全局队列中的G被饿死。
 4. 如果上一步没有找到G，从P的本地队列获取G。
 5. 如果上一步没有找到G，调用 findrunnable 找G，找不到的话就将M休眠，等待唤醒。
 6. 调用 execute 执行G
@@ -238,4 +222,183 @@ TLS在[这篇博文](https://zboya.github.io/post/go_scheduler/)中有说明:
 
 ## findrunnable - 找到可用的G
 
+```go
+// 找到一个可以运行的G，不找到就让M休眠，然后等待唤醒，直到找到一个G返回
+func findrunnable() (gp *g, inheritTime bool) {
+	_g_ := getg()
+
+top:
+	...
+
+	// 检查有无需要执行的timer
+	now, pollUntil, _ := checkTimers(_p_, 0)
+
+	...
+
+	// 从P本地队列获取G，如果获取到就返回
+	if gp, inheritTime := runqget(_p_); gp != nil {
+		return gp, inheritTime
+	}
+
+	// 从全局队列获取G，如果获取到就返回
+	if sched.runqsize != 0 {
+		lock(&sched.lock)
+		gp := globrunqget(_p_, 0)
+		unlock(&sched.lock)
+		if gp != nil {
+			return gp, false
+		}
+	}
+
+	// 检查netpoll（网络轮询）
+	// 检查是否有因网络就绪而变为可执行的G，如果有，就把G拿来执行。
+	// 条件：网络轮询已初始化 && 存在等待网络的G（waiter） && 当前没有（别的线程）在进行网络轮询检查。
+	if netpollinited() && atomic.Load(&netpollWaiters) > 0 && atomic.Load64(&sched.lastpoll) != 0 {
+		if list := netpoll(0); !list.empty() { // non-blocking
+			gp := list.pop()
+			injectglist(&list)
+			casgstatus(gp, _Gwaiting, _Grunnable)
+			if trace.enabled {
+				traceGoUnpark(gp, 0)
+			}
+			return gp, false
+		}
+	}
+
+	// 工作窃取
+	// 如果当前M正在自旋，或者没在自旋但所有自旋M数量不到工作中P数量的一半，
+	// 则可以进入自旋，并进行工作窃取。
+	procs := uint32(gomaxprocs)
+	nBusyP := procs - atomic.Load(&sched.npidle)
+	if _g_.m.spinning || 2*atomic.Load(&sched.nmspinning) < nBusyP {
+		if !_g_.m.spinning {
+			_g_.m.spinning = true
+			atomic.Xadd(&sched.nmspinning, 1)
+		}
+
+		gp, inheritTime, tnow, w, newWork := stealWork(now)
+		now = tnow
+		if gp != nil {
+			// Successfully stole.
+			return gp, inheritTime
+		}
+		if newWork {
+			// There may be new timer or GC work; restart to
+			// discover.
+			goto top
+		}
+		if w != 0 && (pollUntil == 0 || w < pollUntil) {
+			// Earlier timer to wait for.
+			pollUntil = w
+		}
+	}
+
+	// 在GC的黑化阶段，获取一个执行GC的G
+	if gcBlackenEnabled != 0 && gcMarkWorkAvailable(_p_) {
+		node := (*gcBgMarkWorkerNode)(gcBgMarkWorkerPool.pop())
+		if node != nil {
+			_p_.gcMarkWorkerMode = gcMarkWorkerIdleMode
+			gp := node.gp.ptr()
+			casgstatus(gp, _Gwaiting, _Grunnable)
+			if trace.enabled {
+				traceGoUnpark(gp, 0)
+			}
+			return gp, false
+		}
+	}
+
+
+	// 保存现场
+	allpSnapshot := allp
+	idlepMaskSnapshot := idlepMask
+	timerpMaskSnapshot := timerpMask
+
+	// return P and block
+	lock(&sched.lock)
+	if sched.gcwaiting != 0 || _p_.runSafePointFn != 0 {
+		unlock(&sched.lock)
+		goto top
+	}
+	// 再一次尝试从全局队列获取G
+	if sched.runqsize != 0 {
+		gp := globrunqget(_p_, 0)
+		unlock(&sched.lock)
+		return gp, false
+	}
+	// 取消P、M绑定
+	if releasep() != _p_ {
+		throw("findrunnable: wrong p")
+	}
+	// 将P设为休眠
+	pidleput(_p_)
+	unlock(&sched.lock)
+
+	// 先把M自旋状态设置为“非自旋”，然后重试和上面类似的获取G步骤
+	wasSpinning := _g_.m.spinning
+	if _g_.m.spinning {
+		_g_.m.spinning = false
+		if int32(atomic.Xadd(&sched.nmspinning, -1)) < 0 {
+			throw("findrunnable: negative nmspinning")
+		}
+
+		// 再次检查 有没有空闲，但本地队列非空的P
+		// 如果有，绑定P，重新开始自旋，并回到开头尝试获取G
+		// Check all runqueues once again.
+		_p_ = checkRunqsNoP(allpSnapshot, idlepMaskSnapshot)
+		if _p_ != nil {
+			acquirep(_p_)
+			_g_.m.spinning = true
+			atomic.Xadd(&sched.nmspinning, 1)
+			goto top
+		}
+
+		// 再次检查 有没有GC任务可运行的P，如果有，绑定P并执行GC任务
+		// Check for idle-priority GC work again.
+		_p_, gp = checkIdleGCNoP()
+		if _p_ != nil {
+			acquirep(_p_)
+			_g_.m.spinning = true
+			atomic.Xadd(&sched.nmspinning, 1)
+
+			// Run the idle worker.
+			_p_.gcMarkWorkerMode = gcMarkWorkerIdleMode
+			casgstatus(gp, _Gwaiting, _Grunnable)
+			if trace.enabled {
+				traceGoUnpark(gp, 0)
+			}
+			return gp, false
+		}
+
+		pollUntil = checkTimersNoP(allpSnapshot, timerpMaskSnapshot, pollUntil)
+	}
+
+	// 再次检查netpoll
+	...
+
+	// 到最后都没有找到G，则M进入休眠
+	stopm()
+	// M被唤醒后，重新回到开头寻找一个可执行的G
+	goto top
+}
+```
+
+1. 检查一下有没有timer能够执行了，这一点和schedule方法一样
+2. 从本地队列获取G
+3. 从全局队列获取G
+4. 检查netpoll：检查是否有因网络就绪而变为可执行的G，如果有，就把G拿来执行
+5. 工作窃取：如果当前M正在自旋，或者没在自旋但所有自旋M数量不到工作中P数量的一半，则可以进入自旋，并进行工作窃取。
+6. GC任务：如果目前GC在特定阶段（黑化），则获取一个执行GC的G
+7. 再一次尝试从全局队列获取G，如果还是获取不到，释放P，将P改为休眠状态。
+8. 如果M处于自旋状态，则再次检查是否以下特定情况
+  - 有没有空闲，但本地队列非空的P。如果有，绑定P，并回到第1步尝试获取G。
+  - 有没有GC任务可运行的P，如果有，绑定P并返回一个执行GC的G。
+  如果不是这两种特殊情况，则不再自旋。
+  另外，在这里还会检查所有P中，最快到期的timer，还有多久到期，赋值给pollUntil变量。
+9. 以pollUntil变量为上限，阻塞检查netpoll。如果从netpoll获取到有G恢复可用了，且能够获取到一个空闲的P，则绑定P并获取一个G。
+9. 执行到这里，表示所有尝试都没有找到G，则M进入休眠，等待被唤醒。M被唤醒时，会立刻绑定一个P，并回到第1步重新开始找G。
+
+注意：`findrunnable`函数是被`schedule`函数调用的，在找到可执行的G之前，M要么自旋要么休眠，都没有从`findrunnable`函数返回。找到可执行的G之后，才会将G返回给`schedule`函数，由`schedule`函数来`execute`执行。
+
 ## newproc - 创建新的G
+
+## sysmon - 系统监控
