@@ -168,6 +168,8 @@ func main() {
 
 	if GOARCH != "wasm" { // no threads on wasm yet, so no sysmon
 		systemstack(func() {
+			// 新建一个系统监控线程（M）
+			// 这里的sysmon函数，会作为M的mstartfn，在线程启动时 mstart1函数中会调用该函数。
 			newm(sysmon, nil, -1)
 		})
 	}
@@ -196,6 +198,7 @@ func main() {
 		inittrace.active = true
 	}
 
+	// 执行runtime包里的init函数
 	doInit(&runtime_inittask) // Must be before defer.
 
 	// Defer unlock so that runtime.Goexit during init does the unlock too.
@@ -206,6 +209,7 @@ func main() {
 		}
 	}()
 
+	// 在mgc.go中实现，创建了2个goroutine负责GC
 	gcenable()
 
 	main_init_done = make(chan bool)
@@ -230,6 +234,7 @@ func main() {
 		cgocall(_cgo_notify_runtime_init_done, nil)
 	}
 
+	// 执行main包里的init函数
 	doInit(&main_inittask)
 
 	// Disable init tracing after main init done to avoid overhead
@@ -246,6 +251,8 @@ func main() {
 		// has a main, but it is not executed.
 		return
 	}
+
+	// 执行main.main
 	fn := main_main // make an indirect call, as the linker doesn't know the address of the main package when laying down the runtime
 	fn()
 	if raceenabled {
@@ -269,8 +276,11 @@ func main() {
 		gopark(nil, nil, waitReasonPanicWait, traceEvGoStop, 1)
 	}
 
+	// 正常退出
 	exit(0)
 	for {
+		// 这里for循环的意思：这里的代码是会出错的，用来确保程序能够退出。
+		// x初始化为nil，*x = 0会出错。
 		var x *int32
 		*x = 0
 	}
@@ -3155,7 +3165,7 @@ top:
 	if _g_.m.spinning && (pp.runnext != 0 || pp.runqhead != pp.runqtail) {
 		throw("schedule: spinning with local work")
 	}
-
+	// 检查有无需要执行的Timer
 	checkTimers(pp, 0)
 
 	var gp *g
@@ -5052,6 +5062,10 @@ var forcegcperiod int64 = 2 * 60 * 1e9
 // golang.org/issue/42515 is needed on NetBSD.
 var needSysmonWorkaround bool = false
 
+// runtime.main中创建了一个执行sysmon函数的M，sysmon作为M的mstartfn
+// M启动时mstart1函数会调用mstartfn也就是sysmon函数。
+// 然后看到sysmon函数中有个无限循环，所以这个M会永远执行sysmon，
+// 不会（像普通M一样）进入调度循环。
 // Always runs without a P, so write barriers are not allowed.
 //
 //go:nowritebarrierrec

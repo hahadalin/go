@@ -1,3 +1,21 @@
+<!-- START doctoc generated TOC please keep comment here to allow auto update -->
+<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+**Table of Contents**  *generated with [DocToc](https://github.com/thlorenz/doctoc)*
+
+- [总览](#%E6%80%BB%E8%A7%88)
+  - [osinit 操作系统相关的初始化](#osinit-%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E7%9B%B8%E5%85%B3%E7%9A%84%E5%88%9D%E5%A7%8B%E5%8C%96)
+  - [schedinit 调度系统初始化](#schedinit-%E8%B0%83%E5%BA%A6%E7%B3%BB%E7%BB%9F%E5%88%9D%E5%A7%8B%E5%8C%96)
+  - [创建main goroutine](#%E5%88%9B%E5%BB%BAmain-goroutine)
+  - [runtime·mstart 启动m0](#runtime%C2%B7mstart-%E5%90%AF%E5%8A%A8m0)
+  - [schedule函数调度实现](#schedule%E5%87%BD%E6%95%B0%E8%B0%83%E5%BA%A6%E5%AE%9E%E7%8E%B0)
+  - [main goroutine开始执行](#main-goroutine%E5%BC%80%E5%A7%8B%E6%89%A7%E8%A1%8C)
+- [细节](#%E7%BB%86%E8%8A%82)
+  - [getg - 获取当前G](#getg---%E8%8E%B7%E5%8F%96%E5%BD%93%E5%89%8Dg)
+  - [findrunnable - 找到可用的G](#findrunnable---%E6%89%BE%E5%88%B0%E5%8F%AF%E7%94%A8%E7%9A%84g)
+  - [newproc - 创建新的G](#newproc---%E5%88%9B%E5%BB%BA%E6%96%B0%E7%9A%84g)
+
+<!-- END doctoc generated TOC please keep comment here to allow auto update -->
+
 # 总览
 
 Golang程序入口：[asm_amd64.s](src\runtime\asm_amd64.s)，`TEXT runtime·rt0_go(SB),NOSPLIT|TOPFRAME,$0`函数。
@@ -129,7 +147,80 @@ func mstart1() {
 
 可以看到不管是`mstart0`还是`mstart1`都是在做一些准备工作，还没有开始调度goroutine，就连main goroutine都没有开始执行。事实如此，goroutine的调度是`schedule`函数负责的。
 
-### getg函数如何拿到当前G
+## schedule函数调度实现
+
+```java
+func schedule() {
+	_g_ := getg()
+
+	...
+
+top:
+	// 如果当前GC需要停止整个世界（STW), 则调用gcstopm休眠当前的M
+	if sched.gcwaiting != 0 {
+		// 为了STW，停止当前的M
+		gcstopm()
+		// STW结束后回到 top
+		goto top
+	}
+
+	// 检查有无需要执行的Timer
+	checkTimers(pp, 0)
+
+	var gp *g
+	var inheritTime bool
+
+	...
+	
+	if gp == nil {
+		// 每隔61次调度，尝试从全局队列中获取G
+		if _g_.m.p.ptr().schedtick%61 == 0 && sched.runqsize > 0 {
+			lock(&sched.lock)
+			gp = globrunqget(_g_.m.p.ptr(), 1)
+			unlock(&sched.lock)
+		}
+	}
+	if gp == nil {
+		// 从p的本地队列中获取
+		gp, inheritTime = runqget(_g_.m.p.ptr())
+	}
+	if gp == nil {
+		// 想尽办法找到可运行的G，比如从p本地队列、全局队列获取。
+		// 如果暂时找不到，就在这个方法里阻塞。
+		gp, inheritTime = findrunnable() // blocks until work is available
+	}
+
+	...
+
+	// println("execute goroutine", gp.goid)
+	// 找到了g，那就执行g上的任务函数
+	execute(gp, inheritTime)
+}
+```
+
+1. 如果当前GC需要停止整个世界（STW), 则调用gcstopm休眠当前的M。
+2. 检查一下有没有Timer能够执行了，Timer是time.Timer和time.Ticker的底层实现。
+3. 每隔61次调度轮回从全局队列找，避免全局队列中的G被饿死。
+4. 如果上一步没有找到G，从P的本地队列获取G。
+5. 如果上一步没有找到G，调用 findrunnable 找G，找不到的话就将M休眠，等待唤醒。
+6. 调用 execute 执行G
+
+因为前面`runtime.mainPC`、`runtime.newproc`已经创建好main goroutine并添加到P的本地队列中，所以在`schedule`第4步能够找到main goroutine并开始执行它。
+
+## main goroutine开始执行
+
+main goroutine的目标函数是`runtime.main`，在proc.go 约145行实现。
+
+1. 创建一个M专门负责执行sysmon（系统监控）函数，这个M会在sysmon中无限循环，不会（像普通M一样）进入调度循环。
+2. `doInit(&runtime_inittask)`执行runtime包里的init函数
+3. `gcenable()`创建2个负责GC的goroutine
+4. `doInit(&main_inittask)`执行main包里的init函数，也就是开发者自己写的init函数。
+5. 执行`main_main`函数，它是由编译器链接到`main.main`函数的，就等同于执行`main.main`。
+6. 退出进程，除了`exit(0)`正常退出，还写了个有错的语句来确保一定能够退出。
+
+# 细节
+
+## getg - 获取当前G
 
 `gets`函数在stubs.go中定义，但没有实现
 ```go
@@ -145,5 +236,6 @@ TLS在[这篇博文](https://zboya.github.io/post/go_scheduler/)中有说明:
 
 就是说：M会把自己的tls字段（指针数组）放到内核线程的TLS中，因为M代表了内核线程，它们的切换是同步的，因此内核线程TLS中始终可以取到对应M的tls字段，从而不难取到对应M的实例m和它当前的G实例g。
 
-# schedule函数调度实现
+## findrunnable - 找到可用的G
 
+## newproc - 创建新的G
