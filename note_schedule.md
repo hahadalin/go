@@ -29,6 +29,7 @@ top:
 		// 每隔61次调度，尝试从全局队列中获取G
 		if _g_.m.p.ptr().schedtick%61 == 0 && sched.runqsize > 0 {
 			lock(&sched.lock)
+			// 上限是1，不会批量转移G到P的本地队列，只返回一个G（如果有）
 			gp = globrunqget(_g_.m.p.ptr(), 1)
 			unlock(&sched.lock)
 		}
@@ -92,7 +93,7 @@ top:
 	}
 
 	// 检查netpoll（网络轮询）
-	// 检查是否有因网络就绪而变为可执行的G，如果有，就把G拿来执行。
+	// 检查是否有恢复可执行的G，如果有，就把G拿来执行。
 	// 条件：网络轮询已初始化 && 存在等待网络的G（waiter） && 当前没有（别的线程）在进行网络轮询检查。
 	if netpollinited() && atomic.Load(&netpollWaiters) > 0 && atomic.Load64(&sched.lastpoll) != 0 {
 		if list := netpoll(0); !list.empty() { // non-blocking
@@ -226,7 +227,7 @@ top:
 1. 检查一下有没有timer能够执行了，这一点和schedule方法一样
 2. 从本地队列获取G
 3. 从全局队列获取G
-4. 检查netpoll：检查是否有因网络就绪而变为可执行的G，如果有，就把G拿来执行
+4. 检查netpoll：检查是否有恢复可执行的G，如果有，就把G拿来执行
 5. 工作窃取：如果当前M正在自旋，或者没在自旋但所有自旋M数量不到工作中P数量的一半，则可以进入自旋，并进行工作窃取。
 6. GC任务：如果目前GC在特定阶段（黑化），则获取一个执行GC的G
 7. 再一次尝试从全局队列获取G，如果还是获取不到，释放P，将P改为休眠状态。
@@ -235,7 +236,7 @@ top:
     - 有没有GC任务可运行的P，如果有，绑定P并返回一个执行GC的G。
   如果不是这两种特殊情况，则不再自旋。
   另外，在这里还会检查所有P中，最快到期的timer，还有多久到期，赋值给pollUntil变量。
-9. 以pollUntil变量为上限，阻塞检查netpoll。如果从netpoll获取到有G恢复可用了，且能够获取到一个空闲的P，则绑定P并获取一个G。
+9. 以pollUntil变量为上限，阻塞检查netpoll。如果从netpoll获取到有G恢复可执行，且能够获取到一个空闲的P，则绑定P并获取一个G。
 9. 执行到这里，表示所有尝试都没有找到G，则M进入休眠，等待被唤醒。M被唤醒时，会立刻绑定一个P，并回到第1步重新开始找G。
 
 注意：`findrunnable`函数是被`schedule`函数调用的，在找到可执行的G之前，M要么自旋要么休眠，都没有从`findrunnable`函数返回。找到可执行的G之后，才会将G返回给`schedule`函数，由`schedule`函数来`execute`执行。

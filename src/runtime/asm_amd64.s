@@ -473,9 +473,11 @@ TEXT runtime·systemstack(SB), NOSPLIT, $0-8
 	MOVQ	g(CX), AX	// AX = g
 	MOVQ	g_m(AX), BX	// BX = m
 
+	// 如果当前G就是gsignal
 	CMPQ	AX, m_gsignal(BX)
 	JEQ	noswitch
 
+	// 如果当前G就是g0。这两种情况会跳转到noswitch处执行。
 	MOVQ	m_g0(BX), DX	// DX = g0
 	CMPQ	AX, DX
 	JEQ	noswitch
@@ -483,22 +485,26 @@ TEXT runtime·systemstack(SB), NOSPLIT, $0-8
 	CMPQ	AX, m_curg(BX)
 	JNE	bad
 
+	// 保存现场：将当前G的状态保存到它的sched数据结构中
 	// switch stacks
 	// save our state in g->sched. Pretend to
 	// be systemstack_switch if the G stack is scanned.
 	CALL	gosave_systemstack_switch<>(SB)
 
+	// 切换到g0系统堆栈
 	// switch to g0
 	MOVQ	DX, g(CX)
 	MOVQ	DX, R14 // set the g register
 	MOVQ	(g_sched+gobuf_sp)(DX), BX
 	MOVQ	BX, SP
 
+	// 调用fn
 	// call target function
 	MOVQ	DI, DX
 	MOVQ	0(DI), DI
 	CALL	DI
 
+	// 切回原本的G
 	// switch back to g
 	get_tls(CX)
 	MOVQ	g(CX), AX

@@ -2,7 +2,7 @@
 
 # 总览
 
-Golang程序入口：[asm_amd64.s](src\runtime\asm_amd64.s)，`TEXT runtime·rt0_go(SB),NOSPLIT|TOPFRAME,$0`函数。
+Golang程序入口：asm_amd64.s，`TEXT runtime·rt0_go(SB),NOSPLIT|TOPFRAME,$0`函数。
 
 1. 创建g0、m0，相互绑定，asm_amd64.s 266行左右
 2. `runtime·osinit` 操作系统相关的初始化
@@ -58,32 +58,7 @@ if procresize(procs) != nil {
 ```
 即，`mainPC`代表了`runtime.main`的函数值。
 
-`newproc`函数在proc.go中实现，
-```go
-// Create a new g running fn.
-// Put it on the queue of g's waiting to run.
-// The compiler turns a go statement into a call to this.
-func newproc(fn *funcval) {
-	gp := getg()
-	pc := getcallerpc()
-	systemstack(func() {
-		newg := newproc1(fn, gp, pc)
-
-		_p_ := getg().m.p.ptr()
-		runqput(_p_, newg, true)
-
-		if mainStarted {
-			wakep()
-		}
-	})
-}
-```
-根据注释、代码可以看出，它干的事有：
-- 用`getg()`取得当前的G
-- 用传入的函数值fn创建一个goroutine `newg`
-- 把`newg`放到当前G的P的G队列里
-
-当前G，在这种情况下，就是g0，它的P就是`runtime.schedinit`创建的所有P中的一个。此时m0和g0绑定，它们和同一个P绑定，`newg`也被放到这个P的G队列中。
+`newproc`函数见[newproc---创建新的g](#newproc---创建新的g)，它会创建以`runtime.main`为目标函数的goroutine，也就是main goroutine。
 
 总结：
 `runtime.mainPC`拿到了`runtime.main`函数的函数值，`runtime.newproc`为这个函数值创建了一个goroutine，就是所谓**main goroutine**，并把它放到g0和m0绑定的P的G队列中。
@@ -137,6 +112,7 @@ func mstart1() {
 
 main goroutine的目标函数是`runtime.main`，在proc.go 约145行实现。
 
+1. 将 `mainStarted` 标识为true，表示main goroutine已经启动，也就是说m0、调度系统的初始化已经完成了，使得（newproc）新建goroutine后尝试唤醒、新建M来执行G。
 1. 创建一个M专门负责执行sysmon（系统监控）函数，这个M会在sysmon中无限循环，不会（像普通M一样）进入调度循环。
 2. `doInit(&runtime_inittask)`执行runtime包里的init函数
 3. `gcenable()`创建2个负责GC的goroutine
@@ -165,8 +141,66 @@ TLS在[这篇博文](https://zboya.github.io/post/go_scheduler/)中有说明:
 
 ## newproc - 创建新的G
 
+`newproc`函数在proc.go 约4100行实现，
+```go
+// Create a new g running fn.
+// Put it on the queue of g's waiting to run.
+// The compiler turns a go statement into a call to this.
+func newproc(fn *funcval) {
+	gp := getg()
+	pc := getcallerpc()
+	systemstack(func() {
+		newg := newproc1(fn, gp, pc)
 
+		_p_ := getg().m.p.ptr()
+		runqput(_p_, newg, true)
 
-## sysmon - 系统监控
+		if mainStarted {
+			wakep()
+		}
+	})
+}
+```
+根据注释、代码可以看出，它干的事有：
+- 用`getg()`取得当前的G
+- 调用`newproc1`函数，为传入的函数值fn创建一个goroutine `newg`
+- 把`newg`放到当前G的M的P的G队列里
+- 如果 `mainStarted` （main goroutine已经启动），`wakep()`复用或者创建一个M并让它自旋。
+
+更多底层实现位于`newproc1`函数中：
+- 先尝试从gfree list获取一个G实例，得以复用G
+- 没有可复用的G，新建一个G，栈的大小是2K
+- 计算栈的很多内部数据，比如栈的大小、边界、pc等等
+- 保存G的gopc（用go创建goroutine的语句的PC）、ancestors（祖先G信息）、startpc（目标函数）
+- 为goroutine生成唯一的goid
 
 ## systemstack - 以系统栈执行函数
+
+在很多地方都有这样的调用：
+
+```go
+systemstack(func() {
+	// do something
+})
+```
+
+`systemstack`函数在stubs.go中定义，但并没有实现，其实现是平台相关的，因此不同的平台有不同的汇编实现，比如amd64的实现就位于asm_amd64.s汇编文件中。
+
+在`systemstack`函数的定义上有这样的注释：
+>systemstack 在系统堆栈上运行 fn。
+>如果从 per-OS-thread (g0) 堆栈调用 systemstack，或者从信号处理 (gsignal) 堆栈调用 systemstack，则 systemstack 直接调用 fn 并返回。
+>否则，系统堆栈将从普通 goroutine 的有限堆栈中调用。 在这种情况下，systemstack 切换到 per-OS-thread 堆栈，调用 fn，然后切换回来。
+
+可见，`systemstack`函数的作用就是：在系统堆栈上运行一个指定的函数fn。
+所谓系统堆栈，简单理解就是g0所代表的堆栈。在系统堆栈上执行的任务是不被抢占、不被GC扫描的，因此一些比较底层的调用就要求只能在系统堆栈上执行。
+
+具体来说，虽然`systemstack`函数的实现是平台相关的，但基本逻辑是一样的：
+- 如果调用`systemstack`函数的当前G就是g0或者gsignal，则fn可以直接调用并返回。
+- 否则
+    - 保存当前G的现场到g.sched数据结构。
+	- 切换到g0堆栈
+	- 执行fn
+	- 恢复原本的G的现场
+	- 返回
+
+和`systemstack`函数类似的还有`mcall`函数、`asmcgocall`函数，它们的作用是类似的：在系统堆栈上调用指定的函数fn，只不过入参不同，而且它们都是平台相关的，都用汇编实现。

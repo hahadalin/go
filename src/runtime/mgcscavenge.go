@@ -165,10 +165,11 @@ func gcPaceScavenger(heapGoal, lastHeapGoal uint64) {
 
 // Sleep/wait state of the background scavenger.
 var scavenge struct {
-	lock                 mutex
-	g                    *g
-	parked               bool
-	timer                *timer
+	lock   mutex
+	g      *g
+	parked bool
+	timer  *timer
+	// 标识sysmon是否需要唤醒scavenger，非0时唤醒
 	sysmonWake           uint32 // Set atomically.
 	printControllerReset bool   // Whether the scavenger is in cooldown.
 }
